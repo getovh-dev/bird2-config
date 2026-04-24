@@ -1,0 +1,45 @@
+- name: Ensure bird directory exists
+  file:
+    path: /etc/bird
+    state: directory
+
+- name: Upload filter config
+  copy:
+    src: filter_bgp.conf
+    dest: /etc/bird/filter_bgp.conf
+
+- name: Validate BYOIP entries (required fields)
+  assert:
+    that:
+      - "item.remote_address is defined"
+      - "item.remote_as is defined"
+      - "item.protocol is defined"
+      - "item.protocol in ['v4','v6']"
+    fail_msg: "BYOIP entry '{{ item.name | default(item.remote_as) }}' missing required field or has invalid protocol (must be 'v4' or 'v6')"
+  loop: "{{ byoip | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default(item.remote_as) }}"
+  when: "byoip is defined and (byoip | length) > 0"
+
+- name: Upload bird.conf
+  template:
+    src: bird.conf.j2
+    dest: /etc/bird/bird.conf
+
+- name: Ensure BYOIP protocols appear in rendered config
+  shell: "grep -qE \"protocol bgp .*_byoip_{{ item.protocol }}\" /etc/bird/bird.conf"
+  loop: "{{ byoip | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default(item.remote_as) }}"
+  register: byoip_check
+  failed_when: |
+    byoip_check is defined and (
+      (byoip_check.rc is defined and byoip_check.rc != 0) or
+      (byoip_check.results is defined and (byoip_check.results | selectattr('rc','!=', 0) | list | length > 0))
+    )
+  changed_when: false
+  when: "byoip is defined and (byoip | length) > 0"
+
+- name: Apply bird config
+  command: birdc configure
+  become: yes
