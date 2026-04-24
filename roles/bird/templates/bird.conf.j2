@@ -1,0 +1,877 @@
+log syslog all;
+debug protocols all;
+
+router id {{ router_id }};
+
+protocol kernel {
+    scan time 60;
+    ipv6 {
+        export filter {
+            # Export routes from BGP, node_v6, router_v6 and master_v6 (also master_6); reject other static routes
+            if source = RTS_STATIC && proto != "master_v6" && proto != "master_6" && proto != "node_v6" && proto != "router_v6" then reject;
+            {% if krt_prefsrc_v6 is defined and krt_prefsrc_v6|trim %}
+            if source = RTS_BGP then krt_prefsrc = {{ krt_prefsrc_v6 }};
+            {% endif %}
+            accept;
+        };
+    };
+} 
+
+protocol device {
+    scan time 60;
+}
+
+include "filter_bgp.conf";
+
+{% macro static_attrs(p) -%}
+    {% if p is mapping and (p.prepend is defined or p.origin is defined) %}
+    {
+        {% if p.prepend is defined %}
+            {% if p.prepend is iterable and p.prepend is not string %}
+                {% for asn in p.prepend %}
+        bgp_path.prepend({{ asn }});
+                {% endfor %}
+            {% else %}
+                {% for i in range(p.prepend|int) %}
+        bgp_path.prepend({{ local_as }});
+                {% endfor %}
+            {% endif %}
+        {% endif %}
+    }
+    {% endif %}
+{%- endmacro %}
+
+protocol static node_v6 {
+    ipv6;
+{% for p in blackhole_v6|default([]) %}
+    {% if p.via is defined %}
+    route {{ p.prefix }} via "{{ p.via }}" {{ static_attrs(p) }};
+    {% else %}
+    route {{ p.prefix if p.prefix is defined else p }} blackhole {{ static_attrs(p) }};
+    {% endif %}
+{% endfor %}
+} 
+
+protocol static router_v6 {
+    ipv6;
+{% for p in blackhole_prefix_v6|default([]) %}
+    {% if p.via is defined %}
+    route {{ p.prefix }} via "{{ p.via }}" {{ static_attrs(p) }};
+    {% else %}
+    route {{ p.prefix if p.prefix is defined else p }} blackhole {{ static_attrs(p) }};
+    {% endif %}
+{% endfor %}
+}
+
+protocol static master_v6 {
+{% if static_routes_master6|default([])|length == 0 %}
+    ipv6 { table master6; };
+{% else %}
+    ipv6 { table master6; };
+{% for r in static_routes_master6|default([]) %}
+    {% if r.via is string and (':' in r.via or '.' in r.via) %}
+    route {{ r.prefix|default(r.network) }} via {{ r.via }};
+    {% else %}
+    route {{ r.prefix|default(r.network) }} via "{{ r.via }}";
+    {% endif %}
+{% endfor %}
+{% endif %}
+}
+
+{% macro pname(n,t,p) -%}
+{{ (n ~ '_' ~ t ~ '_' ~ p)|lower|regex_replace('[^a-z0-9_]', '_') }}
+{%- endmacro %}
+
+{% macro local_line(s) -%}
+{% if s.local_asn is defined %}
+    {% if s.local_address is defined %}local {{ s.local_address }} as {{ s.local_asn }};{% else %}local as {{ s.local_asn }};{% endif %}
+{% else %}
+    {% if s.local_address is defined %}local {{ s.local_address }} as {{ local_as }};{% else %}local as {{ local_as }};{% endif %}
+{% endif %}
+{%- endmacro %}
+
+{% macro add_export_comms(s) -%}
+{% if s.add_on_export is defined or (s['add-on-export'] is defined) %}
+    {% if s.add_on_export is defined %}
+        {% set raw = s.add_on_export %}
+    {% else %}
+        {% set raw = s['add-on-export'] %}
+    {% endif %}
+    {% if raw is string %}
+        {% set comms = raw.split(',') %}
+    {% else %}
+        {% set comms = raw %}
+    {% endif %}
+    {% for c in comms %}
+        {% set _c = c | string | trim | replace('(', '') | replace(')', '') %}
+        {% if ':' in _c %}
+            {% set parts = _c.split(':') %}
+            bgp_community.add(({{ parts[0]|trim }}, {{ parts[1]|trim }}));
+        {% elif ',' in _c %}
+            {% set parts = _c.split(',') %}
+            bgp_community.add(({{ parts[0]|trim }}, {{ parts[1]|trim }}));
+        {% else %}
+            bgp_community.add({{ _c }});
+        {% endif %}
+    {% endfor %}
+{% endif %}
+{%- endmacro %}
+
+{% macro export_with_add(s, cond_expr, remote_as) -%}
+{% if (s.add_on_export is defined and (s.add_on_export is string and s.add_on_export|trim or s.add_on_export is iterable)) or (s['add-on-export'] is defined and (s['add-on-export'] is string and s['add-on-export']|trim or s['add-on-export'] is iterable)) %}
+export filter {
+    {% if s.force_export is defined and s.force_export|length > 0 %}
+        {% set _force = s.force_export %}
+        if ( {% for p in _force %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then accept;
+    {% endif %}
+    {{ add_export_comms(s) }}
+    {{ reject_no_export(s) }}
+    {% if s.prepend is defined and s.prepend|int > 0 %}
+        {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+        bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ remote_as }}));
+        if ({{ cond_expr }}) then {
+            handle_prepend({{ remote_as }});
+            accept;
+        }
+        reject;
+    {% else %}
+        if ({{ cond_expr }}) then accept;
+        reject;
+    {% endif %}
+};
+next hop self;
+{% else %}
+    {% if s.force_export is defined and s.force_export|length > 0 %}
+    export filter {
+        {% set _force = s.force_export %}
+        if ( {% for p in _force %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then accept;
+        {{ reject_no_export(s) }}
+        if ({{ cond_expr }}) then accept;
+        reject;
+    };
+    next hop self;
+    {% else %}
+{{ export_where_respect_no_export(s, cond_expr) }}
+    {% endif %}
+{% endif %}
+{%- endmacro %}
+
+{% macro reject_no_export(s) -%}
+{% if (s.no_export is defined and (s.no_export is string and s.no_export|trim or s.no_export is iterable)) or (s['no-export'] is defined and (s['no-export'] is string and s['no-export']|trim or s['no-export'] is iterable)) %}
+    {% if s.no_export is defined %}
+        {% set _raw = s.no_export %}
+    {% else %}
+        {% set _raw = s['no-export'] %}
+    {% endif %}
+    {% if _raw is string %}
+        {% set _nets = _raw.split(',') %}
+    {% else %}
+        {% set _nets = _raw %}
+    {% endif %}
+    if ( {% for p in _nets %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then reject;
+{%- endif %}
+{%- endmacro %}
+
+{% macro export_where_respect_no_export(s, cond_expr) -%}
+{% if (s.no_export is defined and (s.no_export is string and s.no_export|trim or s.no_export is iterable)) or (s['no-export'] is defined and (s['no-export'] is string and s['no-export']|trim or s['no-export'] is iterable)) %}
+export filter {
+    {% if s.force_export is defined and s.force_export|length > 0 %}
+        {% set _force = s.force_export %}
+        if ( {% for p in _force %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then accept;
+    {% endif %}
+    {{ add_export_comms(s) }}
+    {{ reject_no_export(s) }}
+    if ({{ cond_expr }}) then accept;
+    reject;
+};
+next hop self;
+{% else %}
+export where {{ cond_expr }};
+next hop self;
+{% endif %}
+{%- endmacro %}
+
+{% for s in transit %}
+protocol bgp {{ pname(s.name,'transit',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        {% if s.byoip is defined and s.byoip %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_byoip({{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% else %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_transit({{ s.remote_as }}, false, {{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_transit({{ s.remote_as }}, false, {{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% endif %}
+        {% if s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                {% if s.force_export is defined and s.force_export|length > 0 %}
+                    {% set _force = s.force_export %}
+                    if ( {% for p in _force %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then accept;
+                {% endif %}
+                {{ add_export_comms(s) }}
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                {{ reject_no_export(s) }}
+                if (export_cone({{ s.remote_as }}, BLOCK_IXP)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %} 
+            {{ export_with_add(s, 'export_cone(' ~ s.remote_as ~ ', BLOCK_TRANSIT)', s.remote_as) }}
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our({{ s.remote_as }}, BLOCK_TRANSIT)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            {{ export_with_add(s, 'export_our(' ~ s.remote_as ~ ', BLOCK_TRANSIT)', s.remote_as) }} 
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        {% if s.byoip is defined and s.byoip %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_byoip({{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% else %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_transit({{ s.remote_as }}, false, {{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_transit({{ s.remote_as }}, false, {{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% endif %}
+        {% if s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                {{ add_export_comms(s) }}
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                {{ reject_no_export(s) }}
+                if (export_cone({{ s.remote_as }}, BLOCK_IXP)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %}
+            {{ export_where_respect_no_export(s, 'export_cone(' ~ s.remote_as ~ ', BLOCK_IXP)') }}
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our({{ s.remote_as }}, BLOCK_TRANSIT)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            {% if s.force_export is defined and s.force_export|length > 0 %}
+            export filter {
+                {% set _force = s.force_export %}
+                if ( {% for p in _force %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then accept;
+                {{ reject_no_export(s) }}
+                if (export_our({{ s.remote_as }}, BLOCK_TRANSIT)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %}
+            {{ export_where_respect_no_export(s, 'export_our(' ~ s.remote_as ~ ', BLOCK_TRANSIT)') }}
+            {% endif %}
+            {% endif %} 
+        {% endif %}
+    };
+    {% endif %} 
+}
+{% endfor %}
+
+{% for s in ixp %}
+protocol bgp {{ pname(s.name,'ixp',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        {% if s.byoip is defined and s.byoip %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_byoip({{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% else %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_ixp_trusted({{ s.ixp_id }}, {{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_ixp_trusted({{ s.ixp_id }}, {{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% endif %}
+        {% if s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_cone({{ s.remote_as }}, BLOCK_IXP)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_cone({{ s.remote_as }}, BLOCK_IXP);
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));                {{ reject_no_export(s) }}                if (export_our({{ s.remote_as }}, BLOCK_IXP)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_our({{ s.remote_as }}, BLOCK_IXP);
+            next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        {% if s.byoip is defined and s.byoip %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_byoip({{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% else %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_ixp_trusted({{ s.ixp_id }}, {{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_ixp_trusted({{ s.ixp_id }}, {{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% endif %}
+        {% if s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_cone({{ s.remote_as }}, BLOCK_IXP)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_cone({{ s.remote_as }}, BLOCK_IXP);
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our({{ s.remote_as }}, BLOCK_IXP)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_our({{ s.remote_as }}, BLOCK_IXP);
+            next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+}
+{% endfor %}
+
+{% for s in peers %}
+protocol bgp {{ pname(s.name,'peer',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_peer_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_peer_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {% if s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_cone({{ s.remote_as }}, BLOCK_PEERING)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_cone({{ s.remote_as }}, BLOCK_PEERING);
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our({{ s.remote_as }}, BLOCK_PEERING)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_our({{ s.remote_as }}, BLOCK_PEERING);
+            next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_peer_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_peer_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {% if s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_cone({{ s.remote_as }}, BLOCK_PEERING)) then accept;
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_cone({{ s.remote_as }}, BLOCK_PEERING);
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our({{ s.remote_as }}, BLOCK_PEERING)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_our({{ s.remote_as }}, BLOCK_PEERING);
+            next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+}
+{% endfor %}
+
+{% for s in ibgp %}
+protocol bgp {{ pname(s.name,'ibgp',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_ibgp({{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_ibgp({{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {% if s.export == 'full' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (ibgp_export()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where ibgp_export();
+            next hop self;
+            {% endif %}
+        {% elif s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (ibgp_export_cone()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where ibgp_export_cone();
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our(0, 0)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_our(0, 0);
+            next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_ibgp({{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_ibgp({{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {% if s.export == 'full' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (ibgp_export()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where ibgp_export();
+            next hop self;
+            {% endif %}
+        {% elif s.export == 'cone' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (ibgp_export_cone()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where ibgp_export_cone();
+            next hop self;
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_our(0, 0)) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+            export where export_our(0, 0);
+            next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+}
+{% endfor %}
+
+{% for s in downstreams %}
+protocol bgp {{ pname(s.name,'downstream',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    enforce first as;
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        import limit {{ s.max_prefix_v4|default(10) }} action block;
+        {% if s.byoip is defined and s.byoip %}
+        import where import_byoip({{ s.ping }}, {{ s.speed }});
+        {% else %}
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_downstream_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_downstream_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {% endif %}
+        {% if s.export == 'full' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_to_downstream()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+        export where export_to_downstream();
+        next hop self;
+            {% endif %}
+        {% elif s.export == 'default' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_default()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+        {{ export_with_add(s, 'export_default()', s.remote_as) }}
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_to_downstream()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+        export where export_to_downstream();
+        next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        import limit {{ s.import_limit|default(s.max_prefix_v6)|default(1000) }} action block;
+        {% if s.byoip is defined and s.byoip %}
+            {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+            {% else %}
+            import where import_byoip({{ s.ping }}, {{ s.speed }});
+            {% endif %}
+        {% else %}
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_downstream_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_downstream_trusted({{ s.remote_as }}, {{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {% endif %} 
+        {% if s.export == 'full' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_to_downstream()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+        export where export_to_downstream();
+        next hop self;
+            {% endif %}
+        {% elif s.export == 'default' %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_default()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+        {% if s.force_export is defined and s.force_export|length > 0 %}
+        export filter {
+            {% set _force = s.force_export %}
+            if ( {% for p in _force %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) then accept;
+            if (export_default()) then accept;
+            reject;
+        };
+        next hop self;
+        {% else %}
+        export where export_default();
+        next hop self;
+        {% endif %} 
+            {% endif %}
+        {% else %}
+            {% if s.prepend is defined and s.prepend|int > 0 %}
+            {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+            export filter {
+                bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+                if (export_to_downstream()) then {
+                    handle_prepend({{ s.remote_as }});
+                    accept;
+                }
+                reject;
+            };
+            next hop self;
+            {% else %}
+        export where export_to_downstream();
+        next hop self;
+            {% endif %}
+        {% endif %}
+    };
+    {% endif %} 
+}
+{% endfor %}
+
+# BYOIP sessions
+{% for s in byoip|default([]) %}
+protocol bgp {{ pname(s.name,'byoip',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    enforce first as;
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        import limit {{ s.max_prefix_v4|default(10) }} action block;
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+            import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_byoip({{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {{ export_with_add(s, 'export_to_downstream()', s.remote_as) }}
+    };
+    {% endif %}
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        import limit {{ s.max_prefix_v6|default(50) }} action block;
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import where ( {% for p in s.force_import %} net = {{ p }}{% if not loop.last %} || {% endif %}{% endfor %} ) || import_byoip({{ s.ping }}, {{ s.speed }});
+        {% else %}
+        import where import_byoip({{ s.ping }}, {{ s.speed }});
+        {% endif %}
+        {{ export_with_add(s, 'export_to_downstream()', s.remote_as) }}
+    };
+    {% endif %}
+}
+{% endfor %}
+
+# Route collectors
+{% for s in collectors %}
+protocol bgp {{ pname(s.name,'rc',s.protocol) }} {
+    {{ local_line(s) }}
+    debug { states, routes, filters };
+    neighbor {{ s.remote_address }} as {{ s.remote_as }};
+    {% if s.multihop is defined and s.multihop %}    multihop;{% endif %}
+    {% if s.protocol == 'v4' %}
+    ipv4 {
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import filter {
+            {% for p in s.force_import %}
+            if net = {{ p }} then accept;
+            {% endfor %}
+            reject;
+        };
+        {% else %}
+        import none;
+        {% endif %}
+        {% if s.prepend is defined and s.prepend|int > 0 %} 
+        {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+        export filter {
+            {{ add_export_comms(s) }}
+            bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+            {{ reject_no_export(s) }}
+            if (export_collector()) then {
+                handle_prepend({{ s.remote_as }});
+                accept;
+            }
+            reject;
+        };
+        next hop self;
+        {% else %}
+        {{ export_with_add(s, 'export_collector()', s.remote_as) }}
+        {% endif %}
+    };
+    {% endif %} 
+    {% if s.protocol == 'v6' %}
+    ipv6 {
+        {% if s.force_import is defined and s.force_import|length > 0 %}
+        import filter {
+            {% for p in s.force_import %}
+            if net = {{ p }} then accept;
+            {% endfor %}
+            reject;
+        };
+        {% else %}
+        import none;
+        {% endif %}
+        {% if s.prepend is defined and s.prepend|int > 0 %} 
+        {% set _pp = s.prepend|int if s.prepend|int <= 3 else 3 %}
+        export filter {
+            {{ add_export_comms(s) }}
+            bgp_large_community.add((MY_ASN, LC_PREPEND_{{ _pp }}, {{ s.remote_as }}));
+            {{ reject_no_export(s) }}
+            if (export_collector()) then {
+                handle_prepend({{ s.remote_as }});
+                accept;
+            }
+            reject;
+        };
+        next hop self;
+        {% else %}
+        {{ export_with_add(s, 'export_collector()', s.remote_as) }}
+        {% endif %}
+    };
+    {% endif %}
+}
+{% endfor %}
