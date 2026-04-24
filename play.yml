@@ -1,0 +1,7 @@
+- hosts: "{{ router }}"
+  gather_facts: no
+  vars_files:
+    - "routers/{{ router }}.yml"
+
+  roles:
+    - bird
