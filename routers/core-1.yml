@@ -1,0 +1,209 @@
+ssh_host: "5.175.170.10"
+ansible_user: root
+
+router_id: 10.54.122.111
+local_as: 201541
+
+krt_prefsrc_v6: "2a0d:d940:200e::1"
+
+blackhole_v6:
+  - prefix: "2a0d:d940:70::/44"
+  - prefix: "2a0d:d940:74::/48"
+  - prefix: "2a0d:d940:7e::/47"
+  - prefix: "2a0d:d940:200e::/48"
+  - prefix: "2a0d:d940:2002::/48"
+  - prefix: "2a0b:4e07:46::/48"
+  - prefix: "2a06:1283:8b50::/44"
+  - prefix: "2a06:1283:8b5a::/48"
+  - prefix: "2a06:1283:8b60::/44"
+
+blackhole_prefix_v6: []
+
+static_routes_master6: []
+
+transit:
+  - name: jann
+    protocol: v6
+    local_address: "2a14:c380:900:1::2"
+    remote_address: "2a14:c380:900:1::1"
+    remote_as: 213449
+    ping: 5
+    speed: 10000
+    export: cone
+
+  - name: tmw
+    protocol: v6
+    local_address: "2a0e:b107:27fd:133::2"
+    remote_address: "2a0e:b107:27fd:133::1"
+    remote_as: 215828
+    ping: 5
+    speed: 10000
+    export: cone
+
+  - name: hop179
+    protocol: v6
+    local_address: "2602:f72e:a::8a3"
+    remote_address: "2602:f72e:a::801"
+    remote_as: 11967
+    ping: 5
+    speed: 10000
+    export: cone
+
+ixp:
+  - name: lynqia
+    protocol: v6
+    local_address: "2a14:7580:eff0:ab9e::8"
+    remote_address: "2a14:7580:eff0:ab9e::1"
+    remote_as: 213409
+    ixp_id: 1
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: ams
+    protocol: v6
+    local_address: "2a0e:8f01:1000:11::1d0"
+    remote_address: "2a0e:8f01:1000:11::1"
+    remote_as: 24381
+    ixp_id: 2
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: joh
+    protocol: v6
+    local_address: "2a0e:8f01:1000:45::10c"
+    remote_address: "2a0e:8f01:1000:45::1"
+    remote_as: 24381
+    ixp_id: 3
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: lon
+    protocol: v6
+    local_address: "2a0e:8f01:1000:10::15d"
+    remote_address: "2a0e:8f01:1000:10::1"
+    remote_as: 24381
+    ixp_id: 4
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: fra
+    protocol: v6
+    local_address: "2a0e:8f01:1000:24::1d1"
+    remote_address: "2a0e:8f01:1000:24::1"
+    remote_as: 24381
+    ixp_id: 5
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: dus
+    protocol: v6
+    local_address: "2a0e:8f01:1000:46::181"
+    remote_address: "2a0e:8f01:1000:46::1"
+    remote_as: 24381
+    ixp_id: 6
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: zur
+    protocol: v6
+    local_address: "2a0e:8f01:1000:25::110"
+    remote_address: "2a0e:8f01:1000:25::1"
+    remote_as: 24381
+    ixp_id: 7
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: rio
+    protocol: v6
+    local_address: "2a0e:8f01:1000:64::102"
+    remote_address: "2a0e:8f01:1000:64::1"
+    remote_as: 24381
+    ixp_id: 8
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: fre
+    protocol: v6
+    local_address: "2a0e:8f01:1000:22::14d"
+    remote_address: "2a0e:8f01:1000:22::1"
+    remote_as: 24381
+    ixp_id: 9
+    ping: 1
+    speed: 1000
+    export: cone
+
+  - name: atl
+    protocol: v6
+    local_address: "2401:2060:b109:90::107"
+    remote_address: "2401:2060:b109:90::1"
+    remote_as: 24381
+    ixp_id: 10
+    ping: 1
+    speed: 1000
+    export: cone
+
+peers: []
+
+downstreams:
+  - name: lynqia
+    protocol: v6
+    local_address: "2a14:7580:eff0:ab9e::8"
+    remote_address: "2a14:7580:eff0:ab9e::9"
+    remote_as: 213409
+    ping: 0
+    speed: 10000
+    export: full
+    import_limit: 3000
+
+  - name: v6direct
+    protocol: v6
+    local_address: "2a0d:d940:200e:101::1"
+    remote_address: "2a0d:d940:200e:101::2"
+    remote_as: 213413
+    ping: 0
+    speed: 10000
+    export: full
+    import_limit: 3000
+
+  - name: buzzster
+    protocol: v6
+    local_address: "2a0d:d940:200e:100::1"
+    remote_address: "2a0d:d940:200e:100::2"
+    remote_as: 214819
+    ping: 0
+    speed: 10000
+    export: default
+    import_limit: 3000
+
+  - name: gudis_net
+    protocol: v6
+    local_address: "2a0d:d940:200e:102::1"
+    remote_address: "2a0d:d940:200e:102::2"
+    remote_as: 215899
+    ping: 0
+    speed: 10000
+    export: full
+    import_limit: 30000
+
+byoip: []
+
+ibgp: []
+
+collectors:
+  - name: bgptools
+    protocol: v6
+    local_address: "2a0d:d940:200e::1"
+    remote_address: "2a0c:2f07:9459::b7"
+    remote_as: 212232
+    multihop: true
+    ping: 0
+    speed: 10000
+    export: cone
